@@ -8,40 +8,81 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ecr"
+	"github.com/aws/aws-sdk-go/service/sts"
+	"github.com/pquerna/otp/totp"
 )
-
-const defaultRegion = "us-east-1"
 
 func main() {
 	var (
-		repo   = getenv("PLUGIN_REPO")
-		region = getenv("PLUGIN_REGION", "ECR_REGION", "AWS_REGION")
-		key    = getenv("PLUGIN_ACCESS_KEY", "ECR_ACCESS_KEY", "AWS_ACCESS_KEY_ID")
-		secret = getenv("PLUGIN_SECRET_KEY", "ECR_SECRET_KEY", "AWS_SECRET_ACCESS_KEY")
-		create = parseBoolOrDefault(false, getenv("PLUGIN_CREATE_REPOSITORY", "ECR_CREATE_REPOSITORY"))
+		repo      = getenv("PLUGIN_REPO")
+		region    = getenv("PLUGIN_REGION", "ECR_REGION", "AWS_REGION")
+		key       = getenv("PLUGIN_ACCESS_KEY", "ECR_ACCESS_KEY", "AWS_ACCESS_KEY_ID")
+		secret    = getenv("PLUGIN_SECRET_KEY", "ECR_SECRET_KEY", "AWS_SECRET_ACCESS_KEY")
+		mfaKey    = getenv("PLUGIN_MFA_KEY", "ECR_MFA_KEY", "AWS_MFA_KEY")
+		mfaSerial = getenv("PLUGIN_MFA_SERIAL", "ECR_MFA_SERIAL", "AWS_MFA_SERIAL")
+		create    = parseBoolOrDefault(false, getenv("PLUGIN_CREATE_REPOSITORY", "ECR_CREATE_REPOSITORY"))
 	)
 
-	// set the region
+	// check the region
 	if region == "" {
-		region = defaultRegion
+		log.Fatal("You need to specify region")
 	}
 
 	os.Setenv("AWS_REGION", region)
 
 	if key != "" && secret != "" {
+		log.Printf("Authentication by key/secretKey pair")
+
 		os.Setenv("AWS_ACCESS_KEY_ID", key)
 		os.Setenv("AWS_SECRET_ACCESS_KEY", secret)
 	}
+	if mfaKey != "" && mfaSerial != "" {
+		log.Printf("Authentication by MFA")
+
+		// Get one time token to access AWS
+		key, err := totp.GenerateCode(mfaKey, time.Now())
+		if err != nil {
+			log.Fatalf("error in generating one time password: %v", err)
+		}
+
+		// Request one time token to AWS
+		stsService := sts.New(session.New(&aws.Config{Region: &region}))
+		input := &sts.GetSessionTokenInput{
+			DurationSeconds: aws.Int64(3600),
+			SerialNumber:    aws.String(mfaSerial),
+			TokenCode:       aws.String(key),
+		}
+
+		// Parse response from AWS
+		result, err := stsService.GetSessionToken(input)
+		if err != nil {
+			if aerr, ok := err.(awserr.Error); ok {
+				switch aerr.Code() {
+				case sts.ErrCodeRegionDisabledException:
+					log.Fatal(sts.ErrCodeRegionDisabledException, aerr.Error())
+				default:
+					log.Fatalf("error during getting session token (aws error): %v", aerr)
+				}
+			} else {
+				log.Fatalf("error during getting session token: %v", err)
+			}
+			return
+		}
+
+		os.Setenv("AWS_ACCESS_KEY_ID", *result.Credentials.AccessKeyId)
+		os.Setenv("AWS_SECRET_ACCESS_KEY", *result.Credentials.SecretAccessKey)
+		os.Setenv("AWS_SESSION_TOKEN", *result.Credentials.SessionToken)
+	}
 
 	sess, err := session.NewSession(&aws.Config{Region: &region})
-
 	if err != nil {
-		log.Fatal(fmt.Sprintf("error creating aws session: %v", err))
+		log.Fatalf("error creating aws session: %v", err)
 	}
 
 	svc := ecr.New(sess)
